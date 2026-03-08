@@ -1,4 +1,18 @@
-﻿1. 右键 `Clash_Network_Doctor_CN_deeptrace.ps1` -> 属性，在“常规”里把“解除锁定（来自其他计算机的文件）”勾选并应用。
+﻿# Clash WSL Network Fix
+
+GitHub 网络急救箱 / WSL 网络修复工具
+
+这是一个用于解决 **Clash + WSL 网络问题** 的诊断和修复工具。
+
+支持：
+- WSL 无法访问网络
+- Clash 导致 WSL DNS 失效
+- Windows / WSL 网络冲突
+- 网络诊断与自动修复
+
+
+
+1. 右键 `Clash_Network_Doctor_CN_deeptrace.ps1` -> 属性，在“常规”里把“解除锁定（来自其他计算机的文件）”勾选并应用。
 ![alt text](image.png)
 
 2. 打开 `Clash Verge`。
