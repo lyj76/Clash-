@@ -8,8 +8,11 @@ param(
     [string]$ClashSecret = "",
     [string]$ReportRoot = "",
     [string]$SecretStorePath = "",
+    [ValidateRange(0,3)]
+    [int]$DiagnosticLevel = 0,
     [switch]$NoSecretPrompt = $false,
-    [switch]$ForgetSavedSecret = $false
+    [switch]$ForgetSavedSecret = $false,
+    [switch]$NoPause = $false
 )
 
 Set-StrictMode -Version Latest
@@ -22,8 +25,12 @@ try {
 
 $script:Summary = [ordered]@{}
 $script:Diagnosis = New-Object System.Collections.Generic.List[string]
+$script:DiagnosisBrowser = New-Object System.Collections.Generic.List[string]
+$script:DiagnosisWsl = New-Object System.Collections.Generic.List[string]
+$script:DiagnosisAi = New-Object System.Collections.Generic.List[string]
 $script:Suggestions = New-Object System.Collections.Generic.List[string]
 $script:Details = New-Object System.Collections.Generic.List[string]
+$script:AIDevelopment = New-Object System.Collections.Generic.List[string]
 $script:SecretLoadError = "<empty>"
 $script:SecretSaveError = "<empty>"
 
@@ -36,6 +43,18 @@ function Add-Diagnosis {
     param([string]$Text)
     if ($Text -and -not $script:Diagnosis.Contains($Text)) { [void]$script:Diagnosis.Add($Text) }
 }
+function Add-DiagnosisBrowser {
+    param([string]$Text)
+    if ($Text -and -not $script:DiagnosisBrowser.Contains($Text)) { [void]$script:DiagnosisBrowser.Add($Text) }
+}
+function Add-DiagnosisWsl {
+    param([string]$Text)
+    if ($Text -and -not $script:DiagnosisWsl.Contains($Text)) { [void]$script:DiagnosisWsl.Add($Text) }
+}
+function Add-DiagnosisAi {
+    param([string]$Text)
+    if ($Text -and -not $script:DiagnosisAi.Contains($Text)) { [void]$script:DiagnosisAi.Add($Text) }
+}
 function Add-Suggestion {
     param([string]$Text)
     if ($Text -and -not $script:Suggestions.Contains($Text)) { [void]$script:Suggestions.Add($Text) }
@@ -43,6 +62,10 @@ function Add-Suggestion {
 function Add-Detail {
     param([string]$Text)
     if ($Text -ne $null) { [void]$script:Details.Add($Text) }
+}
+function Add-AiDevelopment {
+    param([string]$Text)
+    if ($Text -ne $null) { [void]$script:AIDevelopment.Add($Text) }
 }
 function Write-Section {
     param([string]$Title)
@@ -62,6 +85,31 @@ function Write-StatusLine {
     $color = if ($Ok) { "Green" } else { "Red" }
     Write-Host ("{0} {1}" -f $mark, $Label) -ForegroundColor $color
     if ($Detail) { Write-Host ("    {0}" -f $Detail) -ForegroundColor DarkGray }
+}
+function Resolve-DiagnosticLevel {
+    param(
+        [int]$RequestedLevel,
+        [switch]$NoPauseMode
+    )
+
+    if ($RequestedLevel -in 1,2,3) { return $RequestedLevel }
+    if ($NoPauseMode -or -not [Environment]::UserInteractive) { return 2 }
+
+    Write-Section "诊断模式 / Diagnostic Level"
+    Write-Host "1. 浏览器 / Clash 快速诊断（最快）" -ForegroundColor Gray
+    Write-Host "2. 浏览器 + WSL 开发诊断（推荐）" -ForegroundColor Gray
+    Write-Host "3. 浏览器 + WSL + AI 开发深度诊断（较慢）" -ForegroundColor Gray
+    $choice = Read-Host "请选择 1 / 2 / 3（直接回车默认 2）"
+    if ([string]::IsNullOrWhiteSpace($choice)) { return 2 }
+    $parsed = 0
+    if ([int]::TryParse($choice, [ref]$parsed) -and $parsed -in 1,2,3) { return $parsed }
+    return 2
+}
+function Get-DiagnosticScopeText {
+    param([int]$Level)
+    if ($Level -eq 1) { return 'Browser + Clash' }
+    if ($Level -eq 2) { return 'Browser + Clash + WSL' }
+    return 'Browser + Clash + WSL + AI Development'
 }
 function Safe-Text {
     param($Value)
@@ -435,6 +483,290 @@ function Invoke-WslProbe {
         Internet = $netOk
         Verdict = $verdict
         Evidence = if ($wslAccessDenied) { "WSL API/服务访问被拒绝（E_ACCESSDENIED）" } elseif ($evidence.Count -gt 0) { $evidence -join " || " } else { "<empty>" }
+    }
+}
+function Get-WslProxyEnvironment {
+    $wslCmd = Get-Command wsl.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $wslCmd) {
+        return [pscustomobject]@{
+            Available = $false
+            HttpProxy = '<empty>'
+            HttpsProxy = '<empty>'
+            AllProxy = '<empty>'
+            NoProxy = '<empty>'
+            Evidence = '未检测到 wsl.exe'
+        }
+    }
+
+    $capture = Invoke-ProcessCapture -FilePath $wslCmd.Source -Arguments @('-e','env') -TimeoutSec 8
+    $combined = (($capture.StdOut + [Environment]::NewLine + $capture.StdErr) -replace "`0",'')
+    $lines = @($combined -split "`r?`n")
+    $map = @{}
+    foreach ($line in $lines) {
+        if ($line -match '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') {
+            $map[$matches[1]] = $matches[2]
+        }
+    }
+
+    $httpProxy = '<empty>'
+    $httpsProxy = '<empty>'
+    $allProxy = '<empty>'
+    $noProxy = '<empty>'
+    foreach ($name in @('HTTP_PROXY','http_proxy')) {
+        if ($map.ContainsKey($name) -and -not [string]::IsNullOrWhiteSpace($map[$name])) { $httpProxy = $map[$name]; break }
+    }
+    foreach ($name in @('HTTPS_PROXY','https_proxy')) {
+        if ($map.ContainsKey($name) -and -not [string]::IsNullOrWhiteSpace($map[$name])) { $httpsProxy = $map[$name]; break }
+    }
+    foreach ($name in @('ALL_PROXY','all_proxy')) {
+        if ($map.ContainsKey($name) -and -not [string]::IsNullOrWhiteSpace($map[$name])) { $allProxy = $map[$name]; break }
+    }
+    foreach ($name in @('NO_PROXY','no_proxy')) {
+        if ($map.ContainsKey($name) -and -not [string]::IsNullOrWhiteSpace($map[$name])) { $noProxy = $map[$name]; break }
+    }
+
+    $evidenceParts = New-Object System.Collections.Generic.List[string]
+    if ($httpProxy -ne '<empty>') { [void]$evidenceParts.Add("HTTP_PROXY=$httpProxy") }
+    if ($httpsProxy -ne '<empty>') { [void]$evidenceParts.Add("HTTPS_PROXY=$httpsProxy") }
+    if ($allProxy -ne '<empty>') { [void]$evidenceParts.Add("ALL_PROXY=$allProxy") }
+    if ($noProxy -ne '<empty>') { [void]$evidenceParts.Add("NO_PROXY=$noProxy") }
+
+    [pscustomobject]@{
+        Available = $true
+        HttpProxy = $httpProxy
+        HttpsProxy = $httpsProxy
+        AllProxy = $allProxy
+        NoProxy = $noProxy
+        Evidence = if ($evidenceParts.Count -gt 0) { $evidenceParts -join ' || ' } else { '<empty>' }
+    }
+}
+function Invoke-WslHttpProbe {
+    param(
+        [string]$Name,
+        [string]$Url,
+        [string]$ProxyHost = "",
+        [int]$ProxyPort = 0,
+        [int]$TimeoutSec = 12
+    )
+
+    $wslCmd = Get-Command wsl.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $wslCmd) {
+        return [pscustomobject]@{
+            Name = $Name; Available = $false; Mode = "<empty>"; OK = $false; Status = "<empty>"; LatencyMs = -1; Verdict = "NO_WSL"; Evidence = "未检测到 wsl.exe"; Error = "未检测到 wsl.exe"
+        }
+    }
+
+    $mode = if ([string]::IsNullOrWhiteSpace($ProxyHost) -or $ProxyPort -le 0) { "direct" } else { "proxy" }
+    $wslProxyEnv = Get-WslProxyEnvironment
+    $curlCheck = Invoke-ProcessCapture -FilePath $wslCmd.Source -Arguments @('-e','which','curl') -TimeoutSec 6
+    if (-not $curlCheck.Ok) {
+        return [pscustomobject]@{
+            Name = $Name; Available = $true; Mode = $mode; OK = $false; Status = "<empty>"; LatencyMs = -1; Verdict = "NO_CURL"; Evidence = Safe-Text ($curlCheck.StdErr + ' ' + $curlCheck.StdOut); Error = "WSL 内未检测到 curl"
+        }
+    }
+
+    $args = New-Object System.Collections.Generic.List[string]
+    [void]$args.Add('-e')
+    if ($mode -eq 'direct') {
+        [void]$args.Add('env')
+        foreach ($name in @('HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy')) {
+            [void]$args.Add('-u')
+            [void]$args.Add($name)
+        }
+    } elseif ($wslProxyEnv.HttpProxy -eq '<empty>' -and $wslProxyEnv.HttpsProxy -eq '<empty>' -and $wslProxyEnv.AllProxy -eq '<empty>') {
+        $proxyUrl = "http://{0}:{1}" -f $ProxyHost, $ProxyPort
+        [void]$args.Add('env')
+        [void]$args.Add(("HTTPS_PROXY={0}" -f $proxyUrl))
+        [void]$args.Add(("HTTP_PROXY={0}" -f $proxyUrl))
+        [void]$args.Add(("ALL_PROXY={0}" -f $proxyUrl))
+    }
+    [void]$args.Add('curl')
+    [void]$args.Add('-L')
+    [void]$args.Add('-sS')
+    [void]$args.Add('-o')
+    [void]$args.Add('/dev/null')
+    [void]$args.Add('-w')
+    [void]$args.Add('HTTP_CODE=%{http_code}|TIME_TOTAL=%{time_total}')
+    [void]$args.Add('--connect-timeout')
+    [void]$args.Add('5')
+    [void]$args.Add('--max-time')
+    [void]$args.Add([string]$TimeoutSec)
+    [void]$args.Add($Url)
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $capture = Invoke-ProcessCapture -FilePath $wslCmd.Source -Arguments $args.ToArray() -TimeoutSec ($TimeoutSec + 4)
+    $sw.Stop()
+    $stdout = Safe-Text $capture.StdOut
+    $stderr = Safe-Text $capture.StdErr
+    $raw = ((($stdout + " " + $stderr) -replace "`0","") -replace '\s+',' ').Trim()
+    if ($raw -match 'E_ACCESSDENIED|Access\s+is\s+denied|拒绝访问') {
+        return [pscustomobject]@{
+            Name = $Name; Available = $true; Mode = $mode; OK = $false; Status = "<empty>"; LatencyMs = -1; Verdict = "WSL_ACCESS_DENIED"; Evidence = "WSL API/服务访问被拒绝"; Error = $raw
+        }
+    }
+
+    $httpCode = "<empty>"
+    $timeMs = [int]$sw.Elapsed.TotalMilliseconds
+    $exitCode = -1
+    if ($raw -match 'HTTP_CODE=([0-9]+)') { $httpCode = $matches[1] }
+    if ($raw -match 'TIME_TOTAL=([^| ]+)') {
+        $timeText = $matches[1]
+        if ($timeText -match '^[0-9]+(\.[0-9]+)?$') {
+            try {
+                $timeMs = [int]([double]$timeText * 1000)
+            } catch {}
+        }
+    }
+    if ($raw -match 'RC=([0-9]+)') {
+        try { $exitCode = [int]$matches[1] } catch {}
+    } elseif ($capture.ExitCode -ne $null) {
+        try { $exitCode = [int]$capture.ExitCode } catch {}
+    }
+
+    $ok = ($httpCode -in @('200','204','301','302'))
+    $verdict = if (-not $capture.Ok -and $capture.TimedOut) { "TIMEOUT" } elseif ($ok) { if ($timeMs -ge 0 -and $timeMs -gt 2500) { "SLOW" } else { "OK" } } elseif ($httpCode -eq "000" -or $exitCode -gt 0) { "FAIL" } else { "UNKNOWN" }
+    [pscustomobject]@{
+        Name = $Name
+        Available = $true
+        Mode = $mode
+        OK = $ok
+        Status = $httpCode
+        LatencyMs = $timeMs
+        Verdict = $verdict
+        Evidence = if ($mode -eq 'proxy' -and $wslProxyEnv.Evidence -ne '<empty>') { ("{0} || env={1}" -f $(if ($raw) { $raw } else { '<empty>' }), $wslProxyEnv.Evidence) } else { $(if ($raw) { $raw } else { "<empty>" }) }
+        Error = if ($ok) { "<empty>" } else { Safe-Text $stderr }
+    }
+}
+function Invoke-WslAiConnectivity {
+    param(
+        [string]$ProxyHost = "",
+        [int]$ProxyPort = 0
+    )
+
+    $targets = @(
+        [pscustomobject]@{ Name = 'PyPI'; Url = 'https://pypi.org/simple/' },
+        [pscustomobject]@{ Name = 'HuggingFace'; Url = 'https://huggingface.co/' },
+        [pscustomobject]@{ Name = 'GitHub'; Url = 'https://github.com/' },
+        [pscustomobject]@{ Name = 'Conda'; Url = 'https://conda.anaconda.org/' },
+        [pscustomobject]@{ Name = 'Ubuntu Repo'; Url = 'https://archive.ubuntu.com/ubuntu/' }
+    )
+
+    $results = New-Object System.Collections.Generic.List[object]
+    $okCount = 0
+    $slowCount = 0
+    $failCount = 0
+    foreach ($target in $targets) {
+        $result = Invoke-WslHttpProbe -Name $target.Name -Url $target.Url -ProxyHost $ProxyHost -ProxyPort $ProxyPort -TimeoutSec 14
+        if ($result.Name -eq 'all_proxy' -or [string]::IsNullOrWhiteSpace($result.Name)) { $result.Name = $target.Name }
+        [void]$results.Add($result)
+        if ($result.Verdict -eq 'OK') { $okCount++ }
+        elseif ($result.Verdict -eq 'SLOW') { $slowCount++ }
+        else { $failCount++ }
+    }
+
+    $verdict = if ($failCount -eq 0 -and $slowCount -eq 0) { 'OK' } elseif ($okCount -gt 0 -or $slowCount -gt 0) { 'PARTIAL' } else { 'FAIL' }
+    [pscustomobject]@{
+        Verdict = $verdict
+        OKCount = $okCount
+        SlowCount = $slowCount
+        FailCount = $failCount
+        Results = $results
+        Mode = if ([string]::IsNullOrWhiteSpace($ProxyHost) -or $ProxyPort -le 0) { 'direct' } else { 'proxy' }
+    }
+}
+function Invoke-WslGitProbe {
+    param(
+        [string]$Repository = 'https://github.com/pytorch/pytorch',
+        [string]$ProxyHost = '',
+        [int]$ProxyPort = 0
+    )
+
+    $wslCmd = Get-Command wsl.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $wslCmd) {
+        return [pscustomobject]@{ Available = $false; Mode = '<empty>'; OK = $false; Verdict = 'NO_WSL'; ExitCode = -1; LatencyMs = -1; Evidence = '未检测到 wsl.exe'; Error = '未检测到 wsl.exe' }
+    }
+
+    $mode = if ([string]::IsNullOrWhiteSpace($ProxyHost) -or $ProxyPort -le 0) { 'direct' } else { 'proxy' }
+    $wslProxyEnv = Get-WslProxyEnvironment
+    $gitCheck = Invoke-ProcessCapture -FilePath $wslCmd.Source -Arguments @('-e','which','git') -TimeoutSec 6
+    if (-not $gitCheck.Ok) {
+        return [pscustomobject]@{ Available = $true; Mode = $mode; OK = $false; Verdict = 'NO_GIT'; ExitCode = 127; LatencyMs = -1; Evidence = Safe-Text ($gitCheck.StdErr + ' ' + $gitCheck.StdOut); Error = 'WSL 内未检测到 git' }
+    }
+
+    $args = New-Object System.Collections.Generic.List[string]
+    [void]$args.Add('-e')
+    if ($mode -eq 'direct') {
+        [void]$args.Add('env')
+        foreach ($name in @('HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy')) {
+            [void]$args.Add('-u')
+            [void]$args.Add($name)
+        }
+    } elseif ($wslProxyEnv.HttpProxy -eq '<empty>' -and $wslProxyEnv.HttpsProxy -eq '<empty>' -and $wslProxyEnv.AllProxy -eq '<empty>') {
+        $proxyUrl = 'http://{0}:{1}' -f $ProxyHost, $ProxyPort
+        [void]$args.Add('env')
+        [void]$args.Add(("HTTPS_PROXY={0}" -f $proxyUrl))
+        [void]$args.Add(("HTTP_PROXY={0}" -f $proxyUrl))
+        [void]$args.Add(("ALL_PROXY={0}" -f $proxyUrl))
+    }
+    [void]$args.Add('git')
+    [void]$args.Add('ls-remote')
+    [void]$args.Add('--heads')
+    [void]$args.Add($Repository)
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $capture = Invoke-ProcessCapture -FilePath $wslCmd.Source -Arguments $args.ToArray() -TimeoutSec 40
+    $sw.Stop()
+    $raw = Safe-Text ((($capture.StdOut + ' ' + $capture.StdErr) -replace "`0",'') -replace '\s+',' ')
+    if ($raw -match 'E_ACCESSDENIED|Access\s+is\s+denied|拒绝访问') {
+        return [pscustomobject]@{ Available = $true; Mode = $mode; OK = $false; Verdict = 'WSL_ACCESS_DENIED'; ExitCode = -1; LatencyMs = -1; Evidence = 'WSL API/服务访问被拒绝'; Error = $raw }
+    }
+
+    $exitCode = -1
+    $latencyMs = [int]$sw.Elapsed.TotalMilliseconds
+    if ($capture.ExitCode -ne $null) { try { $exitCode = [int]$capture.ExitCode } catch {} }
+    $verdict = if ($exitCode -eq 0) { if ($latencyMs -gt 3000) { 'SLOW' } else { 'OK' } } elseif ($exitCode -eq 127) { 'NO_GIT' } elseif ($capture.TimedOut) { 'TIMEOUT' } else { 'FAIL' }
+    [pscustomobject]@{
+        Available = $true
+        Mode = $mode
+        OK = ($exitCode -eq 0)
+        Verdict = $verdict
+        ExitCode = $exitCode
+        LatencyMs = $latencyMs
+        Evidence = if ($mode -eq 'proxy' -and $wslProxyEnv.Evidence -ne '<empty>') { ("{0} || env={1}" -f $raw, $wslProxyEnv.Evidence) } else { $raw }
+        Error = if ($exitCode -eq 0) { '<empty>' } else { $raw }
+    }
+}
+function Get-MtuProbe {
+    param([int]$InterfaceIndex = 0)
+
+    $ipv4Mtu = '<empty>'
+    $routeMtu = '<empty>'
+    $verdict = 'UNKNOWN'
+    $evidence = '<empty>'
+    try {
+        if ($InterfaceIndex -gt 0) {
+            $iface = Get-NetIPInterface -InterfaceIndex $InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($iface -and $iface.NlMtu -ne $null) { $ipv4Mtu = [string]$iface.NlMtu }
+        }
+        $subMtuRoute = Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.DestinationPrefix -eq '198.18.0.0/15' } | Select-Object -First 1
+        if ($subMtuRoute -and $subMtuRoute.PSObject.Properties.Name -contains 'RouteMetric') {
+            $routeMtu = Safe-Text $subMtuRoute.InterfaceIndex
+        }
+        if ($ipv4Mtu -ne '<empty>') {
+            $mtuValue = [int]$ipv4Mtu
+            if ($mtuValue -lt 1360) { $verdict = 'LOW_MTU_RISK' }
+            elseif ($mtuValue -le 1500) { $verdict = 'OK' }
+            else { $verdict = 'UNUSUAL' }
+            $evidence = ('IPv4 MTU={0}; 198.18-route-ifindex={1}' -f $ipv4Mtu, $routeMtu)
+        }
+    } catch {
+        $evidence = Safe-Text $_.Exception.Message
+    }
+    [pscustomobject]@{
+        Verdict = $verdict
+        IPv4Mtu = $ipv4Mtu
+        ClashRouteInterface = $routeMtu
+        Evidence = $evidence
     }
 }
 function Invoke-NcsiProbe {
@@ -909,21 +1241,156 @@ function Get-BrowserRisk {
     [void]$risk.Add("PAC、SwitchyOmega、广告拦截扩展、隐私扩展可能覆盖代理行为。")
     return $risk
 }
+function Get-ProjectVersion {
+    param([string]$BaseDir)
+    try {
+        $verFile = Join-Path $BaseDir "VERSION"
+        if (Test-Path $verFile) {
+            $v = Safe-Text (Get-Content -Path $verFile -Raw -ErrorAction SilentlyContinue)
+            if ($v -ne "<empty>") { return $v }
+        }
+    } catch {}
+    return "0.0.0-dev"
+}
+function Test-StartupReadiness {
+    param([string]$BaseDir,[string]$ProxyHost,[int]$ProxyPort,[int]$ApiPort)
+    $warnings = New-Object System.Collections.Generic.List[string]
+    $blocking = New-Object System.Collections.Generic.List[string]
+    $scriptDirWritable = $true
+    $proxyListening = $true
+    $apiListening = $true
+    $psv = $PSVersionTable.PSVersion
+    if ($psv -lt [version]"5.1") {
+        [void]$blocking.Add(("PowerShell 版本过低: {0}" -f $psv))
+    }
+    try {
+        $probe = Join-Path $BaseDir (".write_probe_{0}.tmp" -f ([Guid]::NewGuid().ToString("N")))
+        Set-Content -Path $probe -Value "ok" -Encoding ASCII -NoNewline -ErrorAction Stop
+        Remove-Item -Path $probe -Force -ErrorAction SilentlyContinue
+    } catch {
+        $scriptDirWritable = $false
+        [void]$blocking.Add(("脚本目录写入失败: {0}" -f (Safe-Text $_.Exception.Message)))
+    }
+    if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
+        [void]$warnings.Add("未检测到 curl.exe，curl 真实链路证据会缺失。")
+    }
+    if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
+        [void]$warnings.Add("未检测到 wsl.exe，WSL 探测会显示 NO_WSL。")
+    }
+    if (-not (Get-NetTCPConnection -State Listen -LocalPort $ProxyPort -ErrorAction SilentlyContinue)) {
+        $proxyListening = $false
+        [void]$warnings.Add(("代理端口 {0}:{1} 当前未监听，可能需要先启动 Clash。" -f $ProxyHost, $ProxyPort))
+    }
+    if (-not (Get-NetTCPConnection -State Listen -LocalPort $ApiPort -ErrorAction SilentlyContinue)) {
+        $apiListening = $false
+        [void]$warnings.Add(("API 端口 {0}:{1} 当前未监听，将尝试自动探测其他常用端口。" -f $ProxyHost, $ApiPort))
+    }
+    [pscustomobject]@{
+        Ready             = ($blocking.Count -eq 0)
+        Warnings          = $warnings
+        Blocking          = $blocking
+        ScriptDirWritable = $scriptDirWritable
+        ProxyListening    = $proxyListening
+        ApiListening      = $apiListening
+    }
+}
+function Get-DoctorExitCode {
+    param(
+        [bool]$ReportSaved,
+        [string]$LocalNetworkStatus,
+        [string]$ChinaDnsStatus,
+        [string]$ChinaHttpStatus,
+        [string]$ClashPortStatus,
+        [string]$ClashProxyHttpStatus,
+        [string]$GlobalDirectHttpStatus,
+        [string]$GlobalDnsStatus,
+        [string]$ClashApiStatus,
+        [string]$StoreStatus,
+        [string]$WslStatus,
+        [string]$WslDirectStatus = "UNKNOWN",
+        [string]$WslProxyStatus = "UNKNOWN",
+        [string]$AiDirectStatus = "UNKNOWN",
+        [string]$AiProxyStatus = "UNKNOWN",
+        [string]$GitProbeStatus = "UNKNOWN",
+        [string]$NcsiStatus,
+        [string]$TlsStatus,
+        [string]$UpdateStatus,
+        [string]$FirewallStatus
+    )
+    if (-not $ReportSaved) { return 30 }
+    $hardFail = $false
+    if ($LocalNetworkStatus -eq "FAIL") { $hardFail = $true }
+    if ($ChinaDnsStatus -eq "FAIL" -and $ChinaHttpStatus -eq "FAIL") { $hardFail = $true }
+    if ($ClashPortStatus -eq "FAIL" -and $ClashProxyHttpStatus -eq "FAIL" -and $GlobalDirectHttpStatus -eq "FAIL") { $hardFail = $true }
+    if ($hardFail) { return 20 }
+    $softWarn = $false
+    if ($GlobalDnsStatus -eq "FAIL") { $softWarn = $true }
+    if ($ClashApiStatus -ne "OK") { $softWarn = $true }
+    if ($StoreStatus -in @("PARTIAL","FAIL","RISK")) { $softWarn = $true }
+    if ($WslStatus -in @("WSL_PARTIAL","WSL_FAIL","WSL_ACCESS_DENIED","NO_WSL","NO_DISTRO")) { $softWarn = $true }
+    if ($WslDirectStatus -in @("FAIL","TIMEOUT","WSL_ACCESS_DENIED","NO_WSL")) { $softWarn = $true }
+    if ($WslProxyStatus -in @("FAIL","TIMEOUT","WSL_ACCESS_DENIED","NO_WSL")) { $softWarn = $true }
+    if ($AiDirectStatus -in @("FAIL","UNKNOWN")) { $softWarn = $true }
+    if ($AiProxyStatus -in @("FAIL","UNKNOWN")) { $softWarn = $true }
+    if ($GitProbeStatus -in @("FAIL","TIMEOUT","UNKNOWN")) { $softWarn = $true }
+    if ($NcsiStatus -in @("PARTIAL","FAIL")) { $softWarn = $true }
+    if ($TlsStatus -in @("TLS12_DISABLED","HANDSHAKE_OR_CERT_RISK")) { $softWarn = $true }
+    if ($UpdateStatus -eq "RISK") { $softWarn = $true }
+    if ($FirewallStatus -eq "FIREWALL_OFF") { $softWarn = $true }
+    if ($softWarn) { return 10 }
+    return 0
+}
 function Save-Report {
-    param([string]$Path)
+    param(
+        [string]$Path,
+        [int]$ExitCode = -1,
+        [string]$ExitCategory = "<empty>"
+    )
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add("==========================================================") | Out-Null
     $lines.Add(" Clash / Network Doctor for Windows") | Out-Null
     $lines.Add(" Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')") | Out-Null
     $lines.Add("==========================================================") | Out-Null
     $lines.Add("") | Out-Null
+    $lines.Add("[RESULT]") | Out-Null
+    $lines.Add(("ExitCode                      : {0}" -f $ExitCode)) | Out-Null
+    $lines.Add(("ExitCategory                  : {0}" -f $ExitCategory)) | Out-Null
+    $lines.Add("") | Out-Null
     $lines.Add("[SUMMARY]") | Out-Null
     foreach ($k in $script:Summary.Keys) { $lines.Add(("{0,-30}: {1}" -f $k, $script:Summary[$k])) | Out-Null }
     $lines.Add("") | Out-Null
     $lines.Add("[DETAILS]") | Out-Null
     foreach ($d in $script:Details) { $lines.Add($d) | Out-Null }
+    if ($script:AIDevelopment.Count -gt 0) {
+        $lines.Add("") | Out-Null
+        $lines.Add("[AI_DEVELOPMENT]") | Out-Null
+        foreach ($d in $script:AIDevelopment) { $lines.Add($d) | Out-Null }
+    }
     $lines.Add("") | Out-Null
     $lines.Add("[DIAGNOSIS]") | Out-Null
+    if ($script:DiagnosisBrowser.Count -gt 0) {
+        $lines.Add("[Browser and Clash]") | Out-Null
+        foreach ($d in $script:DiagnosisBrowser) { $lines.Add(("- {0}" -f $d)) | Out-Null }
+        $lines.Add("") | Out-Null
+    }
+    if ($resolvedDiagnosticLevel -lt 2) {
+        $lines.Add("[WSL Networking]") | Out-Null
+        $lines.Add("- 当前诊断级别未包含 WSL。") | Out-Null
+        $lines.Add("") | Out-Null
+    } elseif ($script:DiagnosisWsl.Count -gt 0) {
+        $lines.Add("[WSL Networking]") | Out-Null
+        foreach ($d in $script:DiagnosisWsl) { $lines.Add(("- {0}" -f $d)) | Out-Null }
+        $lines.Add("") | Out-Null
+    }
+    if ($resolvedDiagnosticLevel -lt 3) {
+        $lines.Add("[AI Development]") | Out-Null
+        $lines.Add("- 当前诊断级别未包含 AI 开发深度探测。") | Out-Null
+        $lines.Add("") | Out-Null
+    } elseif ($script:DiagnosisAi.Count -gt 0) {
+        $lines.Add("[AI Development]") | Out-Null
+        foreach ($d in $script:DiagnosisAi) { $lines.Add(("- {0}" -f $d)) | Out-Null }
+        $lines.Add("") | Out-Null
+    }
     $i = 1
     foreach ($d in $script:Diagnosis) { $lines.Add(("{0}. {1}" -f $i, $d)) | Out-Null; $i++ }
     $lines.Add("") | Out-Null
@@ -936,13 +1403,35 @@ function Save-Report {
 Clear-Host
 Write-Host "Clash / Network Doctor for Windows" -ForegroundColor Cyan
 Write-Host ("开始时间: {0}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss")) -ForegroundColor DarkGray
+$resolvedDiagnosticLevel = Resolve-DiagnosticLevel -RequestedLevel $DiagnosticLevel -NoPauseMode:$NoPause
+$diagnosticScope = Get-DiagnosticScopeText -Level $resolvedDiagnosticLevel
+Write-Host ("诊断级别: {0} ({1})" -f $resolvedDiagnosticLevel, $diagnosticScope) -ForegroundColor DarkGray
 
 $proxyUri = "http://{0}:{1}" -f $ProxyHost, $ProxyPort
 $scriptDir = if ($PSScriptRoot -and (Test-Path $PSScriptRoot)) { $PSScriptRoot } else { (Get-Location).Path }
+$projectVersion = Get-ProjectVersion -BaseDir $scriptDir
+Write-Host ("版本: {0}" -f $projectVersion) -ForegroundColor DarkGray
 $defaultReportRoot = Join-Path $scriptDir "Clash_Network_Doctor_Reports"
 $effectiveReportRoot = if ([string]::IsNullOrWhiteSpace($ReportRoot)) { $defaultReportRoot } else { $ReportRoot }
 $defaultSecretStorePath = Join-Path $scriptDir ".clash_api_secret.dat"
 $effectiveSecretStorePath = if ([string]::IsNullOrWhiteSpace($SecretStorePath)) { $defaultSecretStorePath } else { $SecretStorePath }
+$startup = Test-StartupReadiness -BaseDir $scriptDir -ProxyHost $ProxyHost -ProxyPort $ProxyPort -ApiPort $ApiPort
+Write-Section "启动自检 / Startup Self-Check"
+Write-StatusLine -Label "PowerShell 版本检查" -Ok ($PSVersionTable.PSVersion -ge [version]"5.1") -Detail ([string]$PSVersionTable.PSVersion)
+Write-StatusLine -Label "脚本目录可写检查" -Ok $startup.ScriptDirWritable -Detail $scriptDir
+Write-StatusLine -Label "代理监听预检" -Ok $startup.ProxyListening -Detail ("{0}:{1}" -f $ProxyHost, $ProxyPort)
+Write-StatusLine -Label "API 监听预检" -Ok $startup.ApiListening -Detail ("{0}:{1}" -f $ProxyHost, $ApiPort)
+foreach ($w in $startup.Warnings) { Write-Host ("[!] {0}" -f $w) -ForegroundColor Yellow }
+if (-not $startup.Ready) {
+    foreach ($b in $startup.Blocking) { Write-Host ("[x] {0}" -f $b) -ForegroundColor Red }
+    Write-Host ""
+    Write-Host "启动自检失败，退出码=30" -ForegroundColor Red
+    if ((-not $NoPause) -and [Environment]::UserInteractive) {
+        Write-Host "按回车键退出窗口..." -ForegroundColor Cyan
+        Read-Host | Out-Null
+    }
+    exit 30
+}
 $secretSource = "none"
 $savedSecretUpdated = $false
 if ($ForgetSavedSecret) { Remove-Item -Path $effectiveSecretStorePath -ErrorAction SilentlyContinue }
@@ -957,7 +1446,14 @@ if (-not [string]::IsNullOrWhiteSpace($effectiveClashSecret)) {
     }
 }
 $runFolder = Join-Path $effectiveReportRoot ("Run_{0}" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
-New-Item -Path $runFolder -ItemType Directory -Force | Out-Null
+try {
+    New-Item -Path $runFolder -ItemType Directory -Force -ErrorAction Stop | Out-Null
+} catch {
+    $effectiveReportRoot = Join-Path $env:TEMP "Clash_Network_Doctor_Reports"
+    $runFolder = Join-Path $effectiveReportRoot ("Run_{0}" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    New-Item -Path $runFolder -ItemType Directory -Force | Out-Null
+    Add-Suggestion ("原报告目录不可写，已回退到临时目录: {0}" -f $effectiveReportRoot)
+}
 $reportFile = Join-Path $runFolder ("Clash_Network_Doctor_{0}.txt" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
 
 $nic = Get-PrimaryAdapterInfo
@@ -1057,7 +1553,14 @@ $clashRuntime = if ($clashApi.Available) { Get-ClashRuntimeEvidence -Port $apiPr
 $virtualInfo = Get-VirtualAdapterInfo
 $routePrint = Get-RoutePrintEvidence
 $browserHints = Get-BrowserProfileHints
-$wslProbe = Invoke-WslProbe
+$wslProbe = if ($resolvedDiagnosticLevel -ge 2) { Invoke-WslProbe } else { [pscustomobject]@{ Installed = $false; HasDistro = $false; DistroCount = 0; Distros = '<skipped>'; NetworkingMode = '<skipped>'; MirrorMode = '<skipped>'; LocalhostForwarding = '<skipped>'; Dns = '<skipped>'; Net = '<skipped>'; Internet = '<skipped>'; Verdict = 'SKIPPED'; Evidence = 'DiagnosticLevel<2' } }
+$wslProxyEnv = if ($resolvedDiagnosticLevel -ge 2) { Get-WslProxyEnvironment } else { [pscustomobject]@{ Available = $false; HttpProxy = '<skipped>'; HttpsProxy = '<skipped>'; AllProxy = '<skipped>'; NoProxy = '<skipped>'; Evidence = 'DiagnosticLevel<2' } }
+$wslHttpDirect = if ($resolvedDiagnosticLevel -ge 2) { Invoke-WslHttpProbe -Name "WSL HTTP direct" -Url "https://cp.cloudflare.com/generate_204" } else { [pscustomobject]@{ Name = 'WSL HTTP direct'; Available = $false; Mode = '<skipped>'; OK = $false; Status = '<skipped>'; LatencyMs = -1; Verdict = 'SKIPPED'; Evidence = 'DiagnosticLevel<2'; Error = '<empty>' } }
+$wslHttpProxy = if ($resolvedDiagnosticLevel -ge 2) { Invoke-WslHttpProbe -Name "WSL HTTP via proxy" -Url "https://cp.cloudflare.com/generate_204" -ProxyHost $ProxyHost -ProxyPort $ProxyPort } else { [pscustomobject]@{ Name = 'WSL HTTP via proxy'; Available = $false; Mode = '<skipped>'; OK = $false; Status = '<skipped>'; LatencyMs = -1; Verdict = 'SKIPPED'; Evidence = 'DiagnosticLevel<2'; Error = '<empty>' } }
+$wslAiDirect = if ($resolvedDiagnosticLevel -ge 3) { Invoke-WslAiConnectivity } else { [pscustomobject]@{ Verdict = 'SKIPPED'; OKCount = 0; SlowCount = 0; FailCount = 0; Results = @(); Mode = '<skipped>' } }
+$wslAiProxy = if ($resolvedDiagnosticLevel -ge 3) { Invoke-WslAiConnectivity -ProxyHost $ProxyHost -ProxyPort $ProxyPort } else { [pscustomobject]@{ Verdict = 'SKIPPED'; OKCount = 0; SlowCount = 0; FailCount = 0; Results = @(); Mode = '<skipped>' } }
+$wslGitProbe = if ($resolvedDiagnosticLevel -ge 3) { Invoke-WslGitProbe -ProxyHost $ProxyHost -ProxyPort $ProxyPort } else { [pscustomobject]@{ Available = $false; Mode = '<skipped>'; OK = $false; Verdict = 'SKIPPED'; ExitCode = -1; LatencyMs = -1; Evidence = 'DiagnosticLevel<3'; Error = '<empty>' } }
+$mtuProbe = if ($resolvedDiagnosticLevel -ge 2 -and $nic) { Get-MtuProbe -InterfaceIndex $nic.IfIndex } else { [pscustomobject]@{ Verdict = 'SKIPPED'; IPv4Mtu = '<skipped>'; ClashRouteInterface = '<skipped>'; Evidence = if ($resolvedDiagnosticLevel -ge 2) { '<empty>' } else { 'DiagnosticLevel<2' } } }
 $ncsiProbe = Invoke-NcsiProbe
 $tlsProbe = Get-TlsPolicyProbe
 $updateProbe = Get-UpdateChainProbe
@@ -1093,10 +1596,16 @@ $browserRiskStatus = if ($proxyInfo.ProxyEnable -eq "1" -and ($httpGoogleProxy.O
 $winHttpStatus = if ($proxyInfo.WinHTTP -match 'Direct access') { "DIRECT" } else { "PROXY_OR_AUTO" }
 $storeStatus = $storeProbe.Verdict
 $wslStatus = $wslProbe.Verdict
+$wslDirectStatus = $wslHttpDirect.Verdict
+$wslProxyStatus = $wslHttpProxy.Verdict
+$aiDirectStatus = $wslAiDirect.Verdict
+$aiProxyStatus = $wslAiProxy.Verdict
+$gitProbeStatus = $wslGitProbe.Verdict
 $ncsiStatus = $ncsiProbe.Verdict
 $tlsStatus = $tlsProbe.Verdict
 $updateStatus = $updateProbe.Verdict
 $firewallStatus = $fwProbe.Verdict
+$mtuStatus = $mtuProbe.Verdict
 $networkPathMode = if ($clashApi.Available) { Safe-Text $clashApi.Mode } else { "<empty>" }
 $networkPathTun = if ($clashApi.Available) { Safe-Text $clashApi.TunEnable } else { "<empty>" }
 $networkPathSystemProxy = if ($proxyInfo.ProxyEnable -eq "1") { "ON" } else { "OFF" }
@@ -1131,10 +1640,19 @@ Add-Summary "Browser Risk" $browserRiskStatus
 Add-Summary "WinHTTP Profile" $winHttpStatus
 Add-Summary "Microsoft Store" $storeStatus
 Add-Summary "WSL Network" $wslStatus
+Add-Summary "WSL HTTP Direct" $wslDirectStatus
+Add-Summary "WSL HTTP Proxy" $wslProxyStatus
+Add-Summary "AI Direct" $aiDirectStatus
+Add-Summary "AI Proxy" $aiProxyStatus
+Add-Summary "WSL Git" $gitProbeStatus
 Add-Summary "NCSI Health" $ncsiStatus
 Add-Summary "TLS/Cert" $tlsStatus
 Add-Summary "Update Chain" $updateStatus
 Add-Summary "Firewall/Security" $firewallStatus
+Add-Summary "MTU" $mtuStatus
+Add-Summary "Project Version" $projectVersion
+Add-Summary "Diagnostic Level" ([string]$resolvedDiagnosticLevel)
+Add-Summary "Diagnostic Scope" $diagnosticScope
 
 Add-Detail ("Adapter                     : {0}" -f $(if ($nic) { $nic.Alias } else { "<not found>" }))
 Add-Detail ("Description                 : {0}" -f $(if ($nic) { $nic.Desc } else { "<empty>" }))
@@ -1160,6 +1678,9 @@ Add-Detail ("Clash Secret Saved          : {0}" -f $(if ($savedSecretUpdated) { 
 Add-Detail ("Clash Secret Load Error     : {0}" -f $script:SecretLoadError)
 Add-Detail ("Clash Secret Save Error     : {0}" -f $script:SecretSaveError)
 Add-Detail ("Report Output Folder        : {0}" -f $runFolder)
+Add-Detail ("Project Version             : {0}" -f $projectVersion)
+Add-Detail ("Diagnostic Level            : {0}" -f $resolvedDiagnosticLevel)
+Add-Detail ("Diagnostic Scope            : {0}" -f $diagnosticScope)
 
 Add-Detail ""
 Add-Detail ("System ProxyEnable          : {0}" -f $proxyInfo.ProxyEnable)
@@ -1243,14 +1764,21 @@ Add-Detail ("Service InstallService    : {0}/{1}" -f $svcInstall.Status, $svcIns
 Add-Detail ("Service wuauserv          : {0}/{1}" -f $svcWua.Status, $svcWua.StartType)
 Add-Detail ("Store Probe Verdict       : {0}" -f $storeProbe.Verdict)
 Add-Detail ("Store Probe Evidence      : {0}" -f $storeProbe.Evidence)
-Add-Detail ("WSL Installed             : {0}" -f $(if ($wslProbe.Installed) { "YES" } else { "NO" }))
-Add-Detail ("WSL Distros               : {0}" -f $wslProbe.Distros)
-Add-Detail ("WSL NetworkingMode        : {0}" -f $wslProbe.NetworkingMode)
-Add-Detail ("WSL MirrorMode            : {0}" -f $wslProbe.MirrorMode)
-Add-Detail ("WSL Internet(HTTPS)       : {0}" -f $wslProbe.Internet)
-Add-Detail ("WSL DNS Check             : {0}" -f $wslProbe.Dns)
-Add-Detail ("WSL Probe Verdict         : {0}" -f $wslProbe.Verdict)
-Add-Detail ("WSL Probe Evidence        : {0}" -f $wslProbe.Evidence)
+if ($resolvedDiagnosticLevel -ge 2) {
+    Add-Detail ("WSL Installed             : {0}" -f $(if ($wslProbe.Installed) { "YES" } else { "NO" }))
+    Add-Detail ("WSL Distros               : {0}" -f $wslProbe.Distros)
+    Add-Detail ("WSL NetworkingMode        : {0}" -f $wslProbe.NetworkingMode)
+    Add-Detail ("WSL MirrorMode            : {0}" -f $wslProbe.MirrorMode)
+    Add-Detail ("WSL Proxy Environment     : {0}" -f $wslProxyEnv.Evidence)
+    Add-Detail ("WSL Internet(HTTPS)       : {0}" -f $wslProbe.Internet)
+    Add-Detail ("WSL DNS Check             : {0}" -f $wslProbe.Dns)
+    Add-Detail ("WSL Probe Verdict         : {0}" -f $wslProbe.Verdict)
+    Add-Detail ("WSL Probe Evidence        : {0}" -f $wslProbe.Evidence)
+    Add-Detail ("WSL HTTP Direct           : {0}; status={1}; latency={2} ms" -f $wslHttpDirect.Verdict, $wslHttpDirect.Status, $wslHttpDirect.LatencyMs)
+    Add-Detail ("WSL HTTP Direct Evidence  : {0}" -f $wslHttpDirect.Evidence)
+    Add-Detail ("WSL HTTP Proxy            : {0}; status={1}; latency={2} ms" -f $wslHttpProxy.Verdict, $wslHttpProxy.Status, $wslHttpProxy.LatencyMs)
+    Add-Detail ("WSL HTTP Proxy Evidence   : {0}" -f $wslHttpProxy.Evidence)
+}
 Add-Detail ("NCSI Verdict              : {0}" -f $ncsiProbe.Verdict)
 Add-Detail ("NCSI Evidence             : {0}" -f $ncsiProbe.Evidence)
 Add-Detail ("TLS Policy                : TLS1.2={0}; TLS1.3={1}; LiveHttps={2}/{3}" -f $tlsProbe.TLS12, $tlsProbe.TLS13, $tlsProbe.LiveHttps, $tlsProbe.LiveStatus)
@@ -1261,6 +1789,11 @@ Add-Detail ("Update Chain Evidence     : {0}" -f $updateProbe.Evidence)
 Add-Detail ("Firewall Verdict          : {0}" -f $fwProbe.Verdict)
 Add-Detail ("Firewall Profiles         : {0}" -f $fwProbe.Firewall)
 Add-Detail ("Security AV Products      : {0}" -f $fwProbe.AV)
+if ($resolvedDiagnosticLevel -ge 2) {
+    Add-Detail ("MTU Verdict               : {0}" -f $mtuProbe.Verdict)
+    Add-Detail ("IPv4 MTU                  : {0}" -f $mtuProbe.IPv4Mtu)
+    Add-Detail ("MTU Evidence              : {0}" -f $mtuProbe.Evidence)
+}
 
 Add-Detail ""
 Add-Detail ("Clash API Available        : {0}" -f $(if ($clashApi.Available) { "YES" } else { "NO" }))
@@ -1292,51 +1825,80 @@ Add-Detail ("Network Path Tun           : {0}" -f $networkPathTun)
 Add-Detail ("Network Path SystemProxy   : {0}" -f $networkPathSystemProxy)
 Add-Detail ("Network Path Verdict       : {0}" -f $networkPathVerdict)
 
+if ($resolvedDiagnosticLevel -ge 3) {
+    Add-AiDevelopment ("WSL AI Direct Verdict    : {0} (OK={1}, SLOW={2}, FAIL={3})" -f $wslAiDirect.Verdict, $wslAiDirect.OKCount, $wslAiDirect.SlowCount, $wslAiDirect.FailCount)
+    foreach ($row in $wslAiDirect.Results) {
+        Add-AiDevelopment (("{0,-24}: {1}; status={2}; latency={3} ms; mode={4}" -f $row.Name, $row.Verdict, $row.Status, $row.LatencyMs, $row.Mode))
+    }
+    Add-AiDevelopment ""
+    Add-AiDevelopment ("WSL AI Proxy Verdict     : {0} (OK={1}, SLOW={2}, FAIL={3})" -f $wslAiProxy.Verdict, $wslAiProxy.OKCount, $wslAiProxy.SlowCount, $wslAiProxy.FailCount)
+    foreach ($row in $wslAiProxy.Results) {
+        Add-AiDevelopment (("{0,-24}: {1}; status={2}; latency={3} ms; mode={4}" -f $row.Name, $row.Verdict, $row.Status, $row.LatencyMs, $row.Mode))
+    }
+    Add-AiDevelopment ""
+    Add-AiDevelopment ("WSL GitHub git test      : {0}; latency={1} ms; mode={2}" -f $wslGitProbe.Verdict, $wslGitProbe.LatencyMs, $wslGitProbe.Mode)
+    Add-AiDevelopment ("WSL GitHub git evidence  : {0}" -f $wslGitProbe.Evidence)
+}
+
 if ($localNetworkStatus -eq "OK" -or $localNetworkStatus -eq "PARTIAL") {
     Add-Diagnosis "本地网络基础可用，至少国内访问与默认路由证据成立。"
+    Add-DiagnosisBrowser "本地网络基础可用，至少国内访问与默认路由证据成立。"
 } else {
     Add-Diagnosis "未发现稳定的活动 IPv4 接口或默认网关，本地网络层可能就有问题。"
+    Add-DiagnosisBrowser "未发现稳定的活动 IPv4 接口或默认网关，本地网络层可能就有问题。"
     Add-Suggestion "先确认网卡是否已连接，或切换网络后再复测。"
 }
-if ($dnsCn.OK) { Add-Diagnosis "国内 DNS 解析正常。" } else {
+if ($dnsCn.OK) { Add-Diagnosis "国内 DNS 解析正常。"; Add-DiagnosisBrowser "国内 DNS 解析正常。" } else {
     Add-Diagnosis "国内 DNS 解析失败，可能是本机 DNS、网关 DNS 或网络本身异常。"
+    Add-DiagnosisBrowser "国内 DNS 解析失败，可能是本机 DNS、网关 DNS 或网络本身异常。"
     Add-Suggestion "检查网卡 DNS 配置，必要时改成 223.5.5.5 或 119.29.29.29 后再测。"
 }
-if ($dnsGlobal.OK) { Add-Diagnosis "国外 DNS 解析成功。" } else {
+if ($dnsGlobal.OK) { Add-Diagnosis "国外 DNS 解析成功。"; Add-DiagnosisBrowser "国外 DNS 解析成功。" } else {
     Add-Diagnosis "国外 DNS 解析失败或不稳定。"
+    Add-DiagnosisBrowser "国外 DNS 解析失败或不稳定。"
     Add-Suggestion "若浏览器打不开国外网站，重点检查 Secure DNS、Clash DNS、TUN 或分流规则。"
 }
 if ($port7890.Listening) {
     Add-Diagnosis "代理端口正在监听，说明 Clash 或兼容代理进程大概率在运行。"
+    Add-DiagnosisBrowser "代理端口正在监听，说明 Clash 或兼容代理进程大概率在运行。"
 } else {
     Add-Diagnosis "代理端口未监听，浏览器和命令行即使配置代理也无法连上本地代理。"
+    Add-DiagnosisBrowser "代理端口未监听，浏览器和命令行即使配置代理也无法连上本地代理。"
     Add-Suggestion "确认 Clash 已启动，且本地 HTTP 代理端口确实是 7890。"
 }
 if ($httpGoogleProxy.OK -or $httpCloudflareProxy.OK) {
     Add-Diagnosis "通过本地代理访问国外站点成功，说明代理链路本身可用。"
+    Add-DiagnosisBrowser "通过本地代理访问国外站点成功，说明代理链路本身可用。"
 } else {
     Add-Diagnosis "通过本地代理访问国外站点失败，问题可能在 Clash 节点、订阅、规则、上游网络或证书/TLS。"
+    Add-DiagnosisBrowser "通过本地代理访问国外站点失败，问题可能在 Clash 节点、订阅、规则、上游网络或证书/TLS。"
     Add-Suggestion "检查 Clash 当前节点、订阅是否过期、规则模式以及节点日志。"
 }
 if (-not $httpGoogleDirect.OK -and ($httpGoogleProxy.OK -or $httpCloudflareProxy.OK)) {
-    Add-Diagnosis "直连国外站点失败但代理成功，这是典型的“需要代理才能出海”场景。"
+    Add-Diagnosis '直连国外站点失败但代理成功，这是典型的“需要代理才能出海”场景。'
+    Add-DiagnosisBrowser '直连国外站点失败但代理成功，这是典型的“需要代理才能出海”场景。'
 }
 if ($curlTrace.Available) {
     if ($curlTrace.OK -and $curlTrace.ConnectedToProxy -and $curlTrace.TunnelEstablished -and $curlTrace.TLSOk) {
         Add-Diagnosis "curl 显示已连到本地代理、已建立 CONNECT 隧道、TLS 已完成，命令行代理链证据完整。"
+        Add-DiagnosisBrowser "curl 显示已连到本地代理、已建立 CONNECT 隧道、TLS 已完成，命令行代理链证据完整。"
     } elseif ($curlTrace.OK) {
         Add-Diagnosis "curl 显式指定 -x 后成功，但详细 CONNECT/TLS 证据不完整，仍可说明命令行代理链路基本可用。"
+        Add-DiagnosisBrowser "curl 显式指定 -x 后成功，但详细 CONNECT/TLS 证据不完整，仍可说明命令行代理链路基本可用。"
     } else {
         if ($httpGoogleProxy.OK -or $httpCloudflareProxy.OK) {
             Add-Diagnosis "curl 显式指定 -x 测试失败，但 PowerShell 代理请求成功，问题更像 curl 命令链路或目标站兼容性，而非 Clash 核心代理不可用。"
+            Add-DiagnosisBrowser "curl 显式指定 -x 测试失败，但 PowerShell 代理请求成功，问题更像 curl 命令链路或目标站兼容性，而非 Clash 核心代理不可用。"
             Add-Suggestion "用 curl 测 cp.cloudflare.com/generate_204，并保留 -4、--proxy-http1.1 复测。"
         } else {
             Add-Diagnosis "curl 显式指定 -x 测试失败，且代理 HTTP 测试也失败，问题更偏向代理链路本身。"
+            Add-DiagnosisBrowser "curl 显式指定 -x 测试失败，且代理 HTTP 测试也失败，问题更偏向代理链路本身。"
         }
         Add-Suggestion "重点看 curl Verbose Trace 中 Trying、Connected、CONNECT、TLS 证据。"
     }
 } else {
     Add-Diagnosis "未找到 curl.exe，无法补充命令行级别的真实代理链路证据。"
+    Add-DiagnosisBrowser "未找到 curl.exe，无法补充命令行级别的真实代理链路证据。"
 }
 if ($routePrint.DefaultRoutes.Count -gt 1) {
     Add-Diagnosis "检测到多条默认路由，可能存在网卡优先级、虚拟网卡、VPN 或 TUN 抢路由情况。"
@@ -1351,15 +1913,19 @@ if ($proxyInfo.ProxyEnable -ne "1") {
     Add-Suggestion "打开 Clash 的 System Proxy，或在浏览器/扩展里手动指定 127.0.0.1:7890。"
 } else {
     Add-Diagnosis "系统代理已启用，但仍需确认浏览器没有被 PAC、扩展或独立设置覆盖。"
+    Add-DiagnosisBrowser "系统代理已启用，但仍需确认浏览器没有被 PAC、扩展或独立设置覆盖。"
 }
 if ($browserHints.Chrome.HasSecureDns -or $browserHints.Edge.HasSecureDns) {
-    Add-Diagnosis "至少有一个 Chromium 浏览器存在 Secure DNS 迹象，可能出现“代理没问题但浏览器 DNS 绕过”的情况。"
+    Add-Diagnosis '至少有一个 Chromium 浏览器存在 Secure DNS 迹象，可能出现“代理没问题但浏览器 DNS 绕过”的情况。'
+    Add-DiagnosisBrowser '至少有一个 Chromium 浏览器存在 Secure DNS 迹象，可能出现“代理没问题但浏览器 DNS 绕过”的情况。'
 }
 if ($browserHints.Chrome.HasExtensions -or $browserHints.Edge.HasExtensions) {
     Add-Diagnosis "至少有一个 Chromium 浏览器安装了扩展，代理扩展冲突值得排查。"
+    Add-DiagnosisBrowser "至少有一个 Chromium 浏览器安装了扩展，代理扩展冲突值得排查。"
 }
 if ($winHttpStatus -eq "DIRECT" -and $proxyInfo.ProxyEnable -eq "1") {
     Add-Diagnosis "WinHTTP 仍是 Direct，而系统代理（WinINET）已开启；依赖 WinHTTP 的程序可能不走 Clash。"
+    Add-DiagnosisBrowser "WinHTTP 仍是 Direct，而系统代理（WinINET）已开启；依赖 WinHTTP 的程序可能不走 Clash。"
     Add-Suggestion "若某应用只走 WinHTTP，可在管理员终端执行: netsh winhttp import proxy source=ie 后复测。"
 }
 if ($storeProbe.Verdict -eq "FAIL") {
@@ -1368,29 +1934,122 @@ if ($storeProbe.Verdict -eq "FAIL") {
 } elseif ($storeProbe.Verdict -eq "PARTIAL") {
     Add-Diagnosis ("Microsoft Store 部分异常（OK={0}, FAIL={1}），商店可能出现登录或下载异常。" -f $storeProbe.OKCount, $storeProbe.FailCount)
 }
-if (-not $wslProbe.Installed) {
+if ($resolvedDiagnosticLevel -ge 2 -and -not $wslProbe.Installed) {
     Add-Diagnosis "WSL 未安装，已跳过 WSL 网络探测。"
-} elseif ($wslProbe.Verdict -eq "NO_DISTRO") {
+    Add-DiagnosisWsl "WSL 未安装，已跳过 WSL 网络探测。"
+} elseif ($resolvedDiagnosticLevel -ge 2 -and $wslProbe.Verdict -eq "NO_DISTRO") {
     Add-Diagnosis "WSL 已安装但无发行版，无法执行 WSL 内 DNS/外网连通测试。"
-} elseif ($wslProbe.Verdict -eq "WSL_ACCESS_DENIED") {
+    Add-DiagnosisWsl "WSL 已安装但无发行版，无法执行 WSL 内 DNS/外网连通测试。"
+} elseif ($resolvedDiagnosticLevel -ge 2 -and $wslProbe.Verdict -eq "WSL_ACCESS_DENIED") {
     Add-Diagnosis "WSL 状态读取被拒绝（E_ACCESSDENIED），当前进程权限或 WSL 服务状态异常。"
+    Add-DiagnosisWsl "WSL 状态读取被拒绝（E_ACCESSDENIED），当前进程权限或 WSL 服务状态异常。"
     Add-Suggestion "用管理员 PowerShell 执行 wsl --status 与 wsl -l -q，确认 LxssManager 服务正常。"
-} elseif ($wslProbe.Verdict -eq "WSL_OK") {
+} elseif ($resolvedDiagnosticLevel -ge 2 -and $wslProbe.Verdict -eq "WSL_OK") {
     Add-Diagnosis ("WSL 正常：发行版={0}；模式={1}；镜像网络={2}；外网HTTPS={3}。" -f $wslProbe.Distros, $wslProbe.NetworkingMode, $wslProbe.MirrorMode, $wslProbe.Internet)
-} elseif ($wslProbe.Verdict -eq "WSL_FAIL") {
+    Add-DiagnosisWsl ("WSL 正常：发行版={0}；模式={1}；镜像网络={2}；外网HTTPS={3}。" -f $wslProbe.Distros, $wslProbe.NetworkingMode, $wslProbe.MirrorMode, $wslProbe.Internet)
+} elseif ($resolvedDiagnosticLevel -ge 2 -and $wslProbe.Verdict -eq "WSL_FAIL") {
     Add-Diagnosis ("WSL 异常：发行版={0}；模式={1}；镜像网络={2}；外网HTTPS={3}。" -f $wslProbe.Distros, $wslProbe.NetworkingMode, $wslProbe.MirrorMode, $wslProbe.Internet)
+    Add-DiagnosisWsl ("WSL 异常：发行版={0}；模式={1}；镜像网络={2}；外网HTTPS={3}。" -f $wslProbe.Distros, $wslProbe.NetworkingMode, $wslProbe.MirrorMode, $wslProbe.Internet)
     Add-Suggestion "检查 WSL 网络模式（NAT/mirrored）与宿主机防火墙/VPN 冲突。"
-} elseif ($wslProbe.Verdict -eq "WSL_PARTIAL") {
+} elseif ($resolvedDiagnosticLevel -ge 2 -and $wslProbe.Verdict -eq "WSL_PARTIAL") {
     Add-Diagnosis ("WSL 部分可用：发行版={0}；模式={1}；镜像网络={2}；DNS={3}；外网HTTPS={4}。" -f $wslProbe.Distros, $wslProbe.NetworkingMode, $wslProbe.MirrorMode, $wslProbe.Dns, $wslProbe.Internet)
+    Add-DiagnosisWsl ("WSL 部分可用：发行版={0}；模式={1}；镜像网络={2}；DNS={3}；外网HTTPS={4}。" -f $wslProbe.Distros, $wslProbe.NetworkingMode, $wslProbe.MirrorMode, $wslProbe.Dns, $wslProbe.Internet)
     Add-Suggestion "若 DNS=OK 但外网HTTPS=FAIL，优先检查 WSL 出口路由、公司防火墙、代理与证书链策略。"
 }
-if (($wslProbe.NetworkingMode -replace '\s','').ToLowerInvariant() -eq "mirrored") {
+if ($resolvedDiagnosticLevel -ge 2 -and (($wslProbe.NetworkingMode -replace '\s','').ToLowerInvariant() -eq "mirrored")) {
     Add-Diagnosis "WSL 当前为 mirrored 镜像网络模式。"
-} elseif (($wslProbe.NetworkingMode -replace '\s','').ToLowerInvariant() -eq "nat") {
+    Add-DiagnosisWsl "WSL 当前为 mirrored 镜像网络模式。"
+} elseif ($resolvedDiagnosticLevel -ge 2 -and (($wslProbe.NetworkingMode -replace '\s','').ToLowerInvariant() -eq "nat")) {
     Add-Diagnosis "WSL 当前为 NAT 网络模式。"
+    Add-DiagnosisWsl "WSL 当前为 NAT 网络模式。"
+}
+if ($resolvedDiagnosticLevel -ge 2 -and $wslHttpDirect.Verdict -eq 'OK' -and $wslHttpProxy.Verdict -in @('FAIL','TIMEOUT')) {
+    Add-Diagnosis "WSL 直连 HTTPS 正常，但代理模式失败，当前更像是 WSL 代理继承或代理地址配置问题。"
+    Add-DiagnosisWsl "WSL 直连 HTTPS 正常，但代理模式失败，当前更像是 WSL 代理继承或代理地址配置问题。"
+    Add-Suggestion "优先检查 WSL 内 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 是否指向宿主机可达地址，而不是盲目换节点。"
+} elseif ($resolvedDiagnosticLevel -ge 2 -and $wslHttpDirect.Verdict -in @('FAIL','TIMEOUT') -and $wslHttpProxy.Verdict -eq 'OK') {
+    Add-Diagnosis "WSL 直连失败但代理成功，WSL 更像需要显式代理而不是宿主机基础网络故障。"
+    Add-DiagnosisWsl "WSL 直连失败但代理成功，WSL 更像需要显式代理而不是宿主机基础网络故障。"
+    Add-Suggestion "为 WSL shell、pip、git、conda 设置代理，或在 Clash TUN/路由层确认 WSL 流量是否被接管。"
+} elseif ($resolvedDiagnosticLevel -ge 2 -and $wslHttpDirect.Verdict -in @('FAIL','TIMEOUT') -and $wslHttpProxy.Verdict -in @('FAIL','TIMEOUT')) {
+    Add-Diagnosis "WSL 直连和代理都失败，问题更像宿主机出口、WSL 网络模式、防火墙或上游链路异常。"
+    Add-DiagnosisWsl "WSL 直连和代理都失败，问题更像宿主机出口、WSL 网络模式、防火墙或上游链路异常。"
+} elseif ($resolvedDiagnosticLevel -ge 2 -and $wslHttpDirect.Verdict -in @('OK','SLOW') -and $wslHttpProxy.Verdict -in @('OK','SLOW')) {
+    Add-DiagnosisWsl "WSL 直连链路和代理链路都能成立。"
+}
+if ($resolvedDiagnosticLevel -ge 2 -and $wslProxyEnv.Evidence -ne '<empty>') {
+    Add-Diagnosis "WSL 已存在代理环境变量，镜像网络或 shell 环境可能已经帮你注入代理。"
+    Add-DiagnosisWsl "WSL 已存在代理环境变量，镜像网络或 shell 环境可能已经帮你注入代理。"
+}
+if ($resolvedDiagnosticLevel -ge 3 -and $wslAiDirect.FailCount -gt $wslAiProxy.FailCount) {
+    Add-Diagnosis ("AI 开发站点在 WSL 代理模式下表现更好（直连失败 {0} 项，代理失败 {1} 项）。" -f $wslAiDirect.FailCount, $wslAiProxy.FailCount)
+    Add-DiagnosisAi ("AI 开发站点在 WSL 代理模式下表现更好（直连失败 {0} 项，代理失败 {1} 项）。" -f $wslAiDirect.FailCount, $wslAiProxy.FailCount)
+    Add-Suggestion "对于 HuggingFace、GitHub 这类国际站点，优先考虑在 WSL 内显式配置代理。"
+}
+if ($resolvedDiagnosticLevel -ge 3 -and $wslAiDirect.SlowCount -gt 0 -and $wslAiDirect.FailCount -eq 0) {
+    Add-Diagnosis "WSL AI 开发站点大多可达，但存在明显高延迟，更像国际链路慢而不是完全断网。"
+    Add-DiagnosisAi "WSL AI 开发站点大多可达，但存在明显高延迟，更像国际链路慢而不是完全断网。"
+    Add-Suggestion "PyPI、Conda、Ubuntu Repo 若只是慢，优先考虑使用稳定镜像源，而不是自动切换最近镜像。"
+}
+if ($resolvedDiagnosticLevel -ge 3) {
+foreach ($row in $wslAiDirect.Results) {
+    if ($row.Name -eq 'HuggingFace' -and $row.Verdict -in @('FAIL','TIMEOUT') -and $wslAiProxy.Verdict -ne 'FAIL') {
+        Add-DiagnosisAi "HuggingFace 直连失败时，代理模式更可靠。"
+        Add-Suggestion "HuggingFace 直连失败时优先考虑代理；若代理也慢，再排查节点质量与 TLS 握手。"
+    }
+    if ($row.Name -eq 'PyPI' -and $row.Verdict -eq 'SLOW') {
+        Add-DiagnosisAi "PyPI 可达但慢，更适合优先考虑镜像源。"
+        Add-Suggestion "PyPI 可达但偏慢，适合手动配置镜像源；不建议脚本自动选择镜像。"
+    }
+    if ($row.Name -eq 'Ubuntu Repo' -and $row.Verdict -eq 'SLOW') {
+        Add-DiagnosisAi "Ubuntu Repo 延迟偏高，apt update/apt install 可能明显变慢。"
+        Add-Suggestion "Ubuntu 仓库延迟偏高时，优先手动切换到熟悉的镜像源并保留原始源备份。"
+    }
+}
+}
+if ($resolvedDiagnosticLevel -ge 3 -and $wslGitProbe.Verdict -eq 'OK') {
+    Add-Diagnosis ("WSL 内 git ls-remote 成功（{0} ms），Git 工具链对 GitHub 基本可用。" -f $wslGitProbe.LatencyMs)
+    Add-DiagnosisAi ("WSL 内 git ls-remote 成功（{0} ms），Git 工具链对 GitHub 基本可用。" -f $wslGitProbe.LatencyMs)
+} elseif ($resolvedDiagnosticLevel -ge 3 -and $wslGitProbe.Verdict -eq 'SLOW') {
+    Add-Diagnosis ("WSL 内 git ls-remote 可用但偏慢（{0} ms），git clone/pull 可能明显卡顿。" -f $wslGitProbe.LatencyMs)
+    Add-DiagnosisAi ("WSL 内 git ls-remote 可用但偏慢（{0} ms），git clone/pull 可能明显卡顿。" -f $wslGitProbe.LatencyMs)
+    Add-Suggestion "若网页能开 GitHub 但 git 很慢，优先检查 WSL git 代理、HTTP/2/TLS 与节点质量。"
+} elseif ($resolvedDiagnosticLevel -ge 3 -and $wslGitProbe.Verdict -eq 'NO_GIT') {
+    Add-Diagnosis "WSL 内未检测到 git，已跳过 GitHub 工具链测试。"
+    Add-DiagnosisAi "WSL 内未检测到 git，已跳过 GitHub 工具链测试。"
+    Add-Suggestion "若要验证 AI 开发仓库拉取链路，可先在 WSL 安装 git 后重测。"
+} elseif ($resolvedDiagnosticLevel -ge 3 -and $wslGitProbe.Verdict -in @('FAIL','TIMEOUT')) {
+    Add-Diagnosis "WSL 内 GitHub 网页链路可能可达，但 git 工具链测试失败。"
+    Add-DiagnosisAi "WSL 内 GitHub 网页链路可能可达，但 git 工具链测试失败。"
+    Add-Suggestion "重点检查 WSL git 的 http.proxy / https.proxy 配置，以及 HTTPS 证书链。"
+}
+if ($resolvedDiagnosticLevel -ge 2 -and $mtuProbe.Verdict -eq 'LOW_MTU_RISK') {
+    Add-Diagnosis ("检测到宿主机 IPv4 MTU 偏低（{0}），可能导致 TLS、Git 或大包传输偶发异常。" -f $mtuProbe.IPv4Mtu)
+    Add-DiagnosisWsl ("检测到宿主机 IPv4 MTU 偏低（{0}），可能导致 TLS、Git 或大包传输偶发异常。" -f $mtuProbe.IPv4Mtu)
+    Add-Suggestion "若出现代理已通但 git clone/TLS 偶发失败，可进一步人工排查 MTU/MSS 问题。"
+}
+if ($storeProbe.Verdict -eq 'FAIL') {
+    Add-DiagnosisBrowser "Microsoft Store 关键域名探测均失败，商店更可能是网络/证书/系统服务层问题。"
+} elseif ($storeProbe.Verdict -eq 'PARTIAL') {
+    Add-DiagnosisBrowser ("Microsoft Store 部分异常（OK={0}, FAIL={1}），商店可能出现登录或下载异常。" -f $storeProbe.OKCount, $storeProbe.FailCount)
+}
+if ($ncsiProbe.Verdict -eq 'FAIL') {
+    Add-DiagnosisBrowser 'NCSI 探测失败，系统可能被判定为“无互联网”，影响商店/登录。'
+} elseif ($ncsiProbe.Verdict -eq 'PARTIAL') {
+    Add-DiagnosisBrowser ("NCSI 部分异常：DNS={0} HTTP={1} Content={2}，可能导致系统组件误判离线。" -f $ncsiProbe.Dns, $ncsiProbe.Http, $ncsiProbe.Content)
+}
+if ($clashApi.Available) {
+    Add-DiagnosisBrowser ("Clash API 可访问（探测端口 {0}），可以把 mode、TUN、端口等程序内部状态纳入证据链。" -f $apiProbePort)
+    if ($clashRuntime.Available) {
+        Add-DiagnosisBrowser ("Clash 运行态：存活节点 {0} / 失效节点 {1}（存活率 {2}）。" -f $clashRuntime.AliveProxies, $clashRuntime.DeadProxies, $clashRuntime.AliveRatio)
+        if ($clashRuntime.GroupSelections -ne '<empty>') { Add-DiagnosisBrowser ("Clash 当前策略选择：{0}" -f $clashRuntime.GroupSelections) }
+        if ($clashRuntime.ActiveConnections -ne '<empty>') { Add-DiagnosisBrowser ("Clash 当前活动连接数：{0}，链路分布：{1}" -f $clashRuntime.ActiveConnections, $clashRuntime.TopChains) }
+        if ($clashRuntime.DominantChain -ne '<empty>') { Add-DiagnosisBrowser ("当前主要出口链路：{0}（占比 {1}）。" -f $clashRuntime.DominantChain, $clashRuntime.DominantShare) }
+        if ($networkPathVerdict -ne '<empty>') { Add-DiagnosisBrowser ("当前网络路径判定：{0}。" -f $networkPathVerdict) }
+    }
 }
 if ($ncsiProbe.Verdict -eq "FAIL") {
-    Add-Diagnosis "NCSI 探测失败，系统可能被判定为“无互联网”，影响商店/登录。"
+    Add-Diagnosis 'NCSI 探测失败，系统可能被判定为“无互联网”，影响商店/登录。'
     Add-Suggestion "检查 msftconnecttest 与 dns.msftncsi.com 是否被 DNS/防火墙拦截。"
 } elseif ($ncsiProbe.Verdict -eq "PARTIAL") {
     Add-Diagnosis ("NCSI 部分异常：DNS={0} HTTP={1} Content={2}，可能导致系统组件误判离线。" -f $ncsiProbe.Dns, $ncsiProbe.Http, $ncsiProbe.Content)
@@ -1460,18 +2119,66 @@ Write-StatusLine -Label "代理访问 Google" -Ok $httpGoogleProxy.OK -Detail ("
 Write-StatusLine -Label "curl 真实链路" -Ok ($curlTrace.Available -and $curlTrace.OK) -Detail ("proxy={0}; connect={1}; tls={2}" -f $(if ($curlTrace.ConnectedToProxy) { "YES" } else { "NO" }), $(if ($curlTrace.TunnelEstablished) { "YES" } else { "NO" }), $(if ($curlTrace.TLSOk) { "YES" } else { "NO" }))
 Write-StatusLine -Label "系统代理" -Ok ($proxyInfo.ProxyEnable -eq "1") -Detail ("ProxyEnable={0} ProxyServer={1}" -f $proxyInfo.ProxyEnable, $proxyInfo.ProxyServer)
 Write-StatusLine -Label "Clash API" -Ok $clashApi.Available -Detail ("Mode={0} Tun={1} Error={2}" -f $clashApi.Mode, $clashApi.TunEnable, $clashApi.Error)
-Write-StatusLine -Label "WSL 外网(HTTPS)" -Ok ($wslProbe.Internet -eq "OK") -Detail ("MirrorMode={0}; Internet={1}" -f $wslProbe.MirrorMode, $wslProbe.Internet)
+if ($resolvedDiagnosticLevel -ge 2) {
+    Write-StatusLine -Label "WSL 外网(HTTPS)" -Ok ($wslProbe.Internet -eq "OK") -Detail ("MirrorMode={0}; Internet={1}" -f $wslProbe.MirrorMode, $wslProbe.Internet)
+    Write-StatusLine -Label "WSL 直连 HTTPS" -Ok ($wslHttpDirect.Verdict -in @('OK','SLOW')) -Detail ("status={0}; latency={1}ms" -f $wslHttpDirect.Status, $wslHttpDirect.LatencyMs)
+    Write-StatusLine -Label "WSL 代理 HTTPS" -Ok ($wslHttpProxy.Verdict -in @('OK','SLOW')) -Detail ("status={0}; latency={1}ms" -f $wslHttpProxy.Status, $wslHttpProxy.LatencyMs)
+}
+if ($resolvedDiagnosticLevel -ge 3) {
+    Write-StatusLine -Label "AI 开发直连" -Ok ($wslAiDirect.Verdict -in @('OK','PARTIAL')) -Detail ("OK={0}; SLOW={1}; FAIL={2}" -f $wslAiDirect.OKCount, $wslAiDirect.SlowCount, $wslAiDirect.FailCount)
+    Write-StatusLine -Label "AI 开发代理" -Ok ($wslAiProxy.Verdict -in @('OK','PARTIAL')) -Detail ("OK={0}; SLOW={1}; FAIL={2}" -f $wslAiProxy.OKCount, $wslAiProxy.SlowCount, $wslAiProxy.FailCount)
+    Write-StatusLine -Label "WSL GitHub Git" -Ok ($wslGitProbe.Verdict -in @('OK','SLOW')) -Detail ("mode={0}; latency={1}ms; verdict={2}" -f $wslGitProbe.Mode, $wslGitProbe.LatencyMs, $wslGitProbe.Verdict)
+}
 
 Write-Section "详细证据 / Details"
 foreach ($d in $script:Details) {
     if ($d -eq "") { Write-Host "" } else { Write-Host $d -ForegroundColor Gray }
 }
 
+if ($resolvedDiagnosticLevel -ge 3) {
+    Write-Section "AI Development"
+    foreach ($d in $script:AIDevelopment) {
+        if ($d -eq "") { Write-Host "" } else { Write-Host $d -ForegroundColor Gray }
+    }
+}
+
 Write-Section "诊断解释 / Diagnosis"
-$i = 1
-foreach ($d in $script:Diagnosis) {
-    Write-Host ("{0}. {1}" -f $i, $d) -ForegroundColor White
-    $i++
+Write-Host "[1] Windows 浏览器与 Clash" -ForegroundColor White
+if ($script:DiagnosisBrowser.Count -gt 0) {
+    foreach ($d in $script:DiagnosisBrowser) {
+        Write-Host ("- {0}" -f $d) -ForegroundColor White
+    }
+} else {
+    Write-Host "- 当前没有生成浏览器/Clash 诊断文本。" -ForegroundColor DarkGray
+}
+
+Write-Host ""
+Write-Host "[2] WSL 联网" -ForegroundColor White
+if ($resolvedDiagnosticLevel -lt 2) {
+    Write-Host "- 当前诊断级别未包含 WSL。" -ForegroundColor DarkGray
+} elseif ($script:DiagnosisWsl.Count -gt 0) {
+    foreach ($d in $script:DiagnosisWsl) {
+        Write-Host ("- {0}" -f $d) -ForegroundColor White
+    }
+} else {
+    Write-Host "- 当前没有生成 WSL 诊断文本。" -ForegroundColor DarkGray
+}
+
+Write-Host ""
+Write-Host "[3] AI 开发访问" -ForegroundColor White
+if ($resolvedDiagnosticLevel -lt 3) {
+    Write-Host "- 当前诊断级别未包含 AI 开发深度探测。" -ForegroundColor DarkGray
+} elseif ($script:DiagnosisAi.Count -gt 0) {
+    foreach ($d in $script:DiagnosisAi) {
+        Write-Host ("- {0}" -f $d) -ForegroundColor White
+    }
+} else {
+    Write-Host "- 当前没有生成 AI 开发诊断文本。" -ForegroundColor DarkGray
+}
+
+if ($script:Diagnosis.Count -gt 0) {
+    Write-Host ""
+    Write-Host "补充技术结论已合并到以上三段。" -ForegroundColor DarkGray
 }
 
 Write-Section "建议动作 / Suggestions"
@@ -1481,15 +2188,30 @@ foreach ($s in $script:Suggestions) {
     $i++
 }
 
+$reportSaved = $false
+$exitCode = Get-DoctorExitCode -ReportSaved $true -LocalNetworkStatus $localNetworkStatus -ChinaDnsStatus $chinaDnsStatus -ChinaHttpStatus $chinaHttpStatus -ClashPortStatus $clashPortStatus -ClashProxyHttpStatus $clashProxyHttpStatus -GlobalDirectHttpStatus $globalDirectHttpStatus -GlobalDnsStatus $globalDnsStatus -ClashApiStatus $clashApiStatus -StoreStatus $storeStatus -WslStatus $wslStatus -WslDirectStatus $wslDirectStatus -WslProxyStatus $wslProxyStatus -AiDirectStatus $aiDirectStatus -AiProxyStatus $aiProxyStatus -GitProbeStatus $gitProbeStatus -NcsiStatus $ncsiStatus -TlsStatus $tlsStatus -UpdateStatus $updateStatus -FirewallStatus $firewallStatus
+$exitCategory = if ($exitCode -eq 0) { "SUCCESS" } elseif ($exitCode -eq 10) { "PARTIAL" } elseif ($exitCode -eq 20) { "FAIL" } else { "RUNTIME_ERROR" }
+
 try {
-    Save-Report -Path $reportFile
+    Save-Report -Path $reportFile -ExitCode $exitCode -ExitCategory $exitCategory
+    $reportSaved = $true
     Write-Host ""
     Write-Host ("报告已保存到: {0}" -f $reportFile) -ForegroundColor Green
 } catch {
+    $reportSaved = $false
+    $exitCode = 30
+    $exitCategory = "RUNTIME_ERROR"
     Write-Host ""
     Write-Host ("报告保存失败: {0}" -f $_.Exception.Message) -ForegroundColor Red
 }
 
+Add-Summary "Exit Code" ([string]$exitCode)
+Add-Summary "Exit Category" $exitCategory
+Write-Host ("退出码: {0} ({1})" -f $exitCode, $exitCategory) -ForegroundColor DarkCyan
+
 Write-Host ""
-Write-Host "脚本执行完毕。请按回车键退出窗口..." -ForegroundColor Cyan
-Read-Host | Out-Null
+if ((-not $NoPause) -and [Environment]::UserInteractive) {
+    Write-Host "脚本执行完毕。请按回车键退出窗口..." -ForegroundColor Cyan
+    Read-Host | Out-Null
+}
+exit $exitCode
