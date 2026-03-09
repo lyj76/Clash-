@@ -1,5 +1,5 @@
 ﻿# Clash Network Doctor (Windows + Clash + WSL)
-
+clash网络急救箱网络诊断器/wsl网络急救箱网络诊断器
 当前版本：`1.4.0`
 
 ## 目录约定
